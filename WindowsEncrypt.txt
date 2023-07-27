@@ -1,184 +1,193 @@
-#include <Windows.h>
+ #include <Windows.h>
+#include <wincrypt.h>
 #include <iostream>
+#include <fstream>
 #include <vector>
-#include <Wincrypt.h>
+#include <cstdio>
 
-#pragma comment(lib, "Crypt32.lib")
+#define BUFFER_SIZE 4096
 
-bool EncryptData(const BYTE *key, const BYTE *data, DWORD data_size, std::vector<BYTE> &encrypted_data, std::vector<BYTE> &iv);
+BOOL CreateAes(CryptoPP::AutoSeededRandomPool& rnd, BYTE* key, BYTE* iv, const DWORD& key_size);
+BOOL Encrypt(AESCONTEXT* pAesContext, BYTE* data, DWORD& length);
+BOOL EncryptAes(AESCONTEXT* pAesContext, BYTE* data, DWORD length, BYTE*& output, DWORD& output_length);
+void CloseAes(AESCONTEXT* pAesContext);
 
-bool DecryptData(const BYTE *key, const BYTE *data, DWORD data_size, const BYTE *iv, std::vector<BYTE> &decrypted_data);
+BOOL CreateCompressor(HCOMPRESSOR& hCompressor);
+BOOL Compress(HCOMPRESSOR& hCompressor, BYTE* data, DWORD& length);
+void CloseCompressor(HCOMPRESSOR hCompressor);
 
-int main() {
-    // 对称密钥
-    const BYTE secret_key[32] = { /* Your 32-byte secret key here. */ };
-
-    // 原始数据
-    const char *data = "Your plain text data here.";
-
-    std::vector<BYTE> encrypted_data;
-    std::vector<BYTE> iv(16);
-    std::vector<BYTE> decrypted_data;
-
-    // 加密数据
-    if (EncryptData(secret_key, reinterpret_cast<const BYTE *>(data), strlen(data) + 1, encrypted_data, iv)) {
-        std::cout << "Encrypted data: ";
-        for (size_t i = 0; i < encrypted_data.size(); i++) {
-            printf("%02X", encrypted_data[i]);
-        }
-        std::cout << std::endl;
-
-        std::cout << "IV: ";
-        for (size_t i = 0; i < 16; i++) {
-            printf("%02X", iv[i]);
-        }
-        std::cout << std::endl;
-    } else {
-        std::cerr << "Encryption failed." << std::endl;
-        return 1;
+int main()
+{
+    // 打开输入文件
+    std::ifstream fin("inputfile", std::ios::binary | std::ios::in);
+    if (!fin.is_open())
+    {
+        std::cerr << "Failed to open input file." << std::endl;
+        return -1;
     }
 
-    // 解密数据
-    if (DecryptData(secret_key, encrypted_data.data(), encrypted_data.size(), iv.data(), decrypted_data)) {
-        std::cout << "Decrypted data: ";
-        for (size_t i = 0; i < decrypted_data.size(); i++) {
-            printf("%c", decrypted_data[i]);
-        }
-        std::cout << std::endl;
-    } else {
-        std::cerr << "Decryption failed." << std::endl;
-        return 1;
+    // 创建AES加密上下文
+    BYTE key[32] = { 0 };
+    BYTE iv[16] = { 0 };
+    CryptoPP::AutoSeededRandomPool rnd;
+    if (!CreateAes(rnd, key, iv, 256))
+    {
+        std::cerr << "Failed to create AES context." << std::endl;
+        return -1;
     }
+
+    AESCONTEXT* pAesContext = nullptr;
+    if (!CreateAesContext(key, 256, iv, pAesContext))
+    {
+        std::cerr << "Failed to create AES context." << std::endl;
+        CloseAes(pAesContext);
+        return -1;
+    }
+
+    // 创建压缩上下文
+    HCOMPRESSOR hCompressor = nullptr;
+    if (!CreateCompressor(hCompressor))
+    {
+        std::cerr << "Failed to create compressor context." << std::endl;
+        CloseCompressor(hCompressor);
+        CloseAes(pAesContext);
+        return -1;
+    }
+
+    // 打开输出文件
+    std::ofstream fout("outputfile", std::ios::binary | std::ios::out);
+    if (!fout.is_open())
+    {
+        std::cerr << "Failed to open output file." << std::endl;
+        CloseCompressor(hCompressor);
+        CloseAes(pAesContext);
+        return -1;
+    }
+
+    // 对数据进行压缩和加密，并直接写入到输出文件中
+    BYTE buffer[BUFFER_SIZE];
+    DWORD read_bytes, write_bytes;
+    while (fin.read(reinterpret_cast<char*>(buffer), BUFFER_SIZE))
+    {
+        read_bytes = static_cast<DWORD>(fin.gcount());
+        if (!Compress(hCompressor, buffer, read_bytes) || !Encrypt(pAesContext, buffer, read_bytes))
+        {
+            std::cerr << "Failed to Compress and/or Encrypt the data." << std::endl;
+            CloseCompressor(hCompressor);
+            CloseAes(pAesContext);
+            return -1;
+        }
+
+        fout.write(reinterpret_cast<char*>(buffer), read_bytes);
+        write_bytes += read_bytes;
+    }
+
+    // 对最后剩余的数据进行压缩和加密，并写入到输出文件中
+    if (fin.eof())
+    {
+        read_bytes = static_cast<DWORD>(fin.gcount());
+        if (!Compress(hCompressor, buffer, read_bytes) || !Encrypt(pAesContext, buffer, read_bytes))
+        {
+            std::cerr << "Failed to Compress and/or Encrypt the data." << std::endl;
+            CloseCompressor(hCompressor);
+            CloseAes(pAesContext);
+            return -1;
+        }
+
+        fout.write(reinterpret_cast<char*>(buffer), read_bytes);
+        write_bytes += read_bytes;
+    }
+
+    // 关闭资源
+    fin.close();
+    fout.close();
+    CloseCompressor(hCompressor);
+    CloseAes(pAesContext);
 
     return 0;
 }
 
-bool EncryptData(const BYTE *key, const BYTE *data, DWORD data_size, std::vector<BYTE> &encrypted_data, std::vector<BYTE> &iv) {
-    HCRYPTPROV hCryptProv = NULL;
-    HCRYPTKEY hKey = NULL;
-    HCRYPTKEY hXchgKey = NULL;
-    HCRYPTHASH hHash = NULL;
-
-    if (!CryptAcquireContext(&hCryptProv, NULL, MS_ENH_RSA_AES_PROV, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-        std::cerr << "Error: CryptAcquireContext" << std::endl;
-        return false;
-    }
-
-    struct {
-        BLOBHEADER header;
-        DWORD key_length;
-        BYTE key[32];
-    } AES256KeyBlob = {
-            {PLAINTEXTKEYBLOB, CUR_BLOB_VERSION, 0, CALG_AES_256},
-            32,
-            {0}
-    };
-    memcpy(AES256KeyBlob.key, key, 32);
-
-    if (!CryptImportKey(hCryptProv, reinterpret_cast<BYTE *>(&AES256KeyBlob), sizeof(AES256KeyBlob), 0, 0, &hKey)) {
-        std::cerr << "Error: CryptImportKey" << std::endl;
-        CryptReleaseContext(hCryptProv, 0);
-        return false;
-    }
-
-    if (!CryptGenRandom(hCryptProv, 16, iv.data())) {
-        std::cerr << "Error: CryptGenRandom" << std::endl;
-        CryptDestroyKey(hKey);
-        CryptReleaseContext(hCryptProv, 0);
-        return false;
-    }
-
-    if (!CryptSetKeyParam(hKey, KP_IV, iv.data(), 0)) {
-        std::cerr << "Error: CryptSetKeyParam" << std::endl;
-        CryptDestroyKey(hKey);
-        CryptReleaseContext(hCryptProv, 0);
-        return false;
-    }
-
-    DWORD padded_data_size = ((data_size + 15) >> 4) << 4;
-    encrypted_data.resize(static_cast<size_t>(padded_data_size));
-    memcpy(encrypted_data.data(), data, data_size);
-
-    if (!CryptEncrypt(hKey, 0, TRUE, 0, encrypted_data.data(), &data_size, padded_data_size)) {
-        std::cerr << "Error: CryptEncrypt" << std::endl;
-        CryptDestroyKey(hKey);
-        CryptReleaseContext(hCryptProv, 0);
-        return false;
-    }
-
-    CryptDestroyHash(hHash);
-    CryptDestroyKey(hKey);
-    CryptDestroyKey(hXchgKey);
-    CryptReleaseContext(hCryptProv, 0);
-
-    return true;
+BOOL CreateAes(CryptoPP::AutoSeededRandomPool& rnd, BYTE* key, BYTE* iv, const DWORD& key_size)
+{
+    rnd.GenerateBlock(key, key_size / 8);
+    rnd.GenerateBlock(iv, 16);
+    return TRUE;
 }
-    
-bool DecryptData(const BYTE *key, const BYTE *data, DWORD data_size, const BYTE *iv, std::vector<BYTE> &decrypted_data) {
-    HCRYPTPROV hCryptProv = NULL;
-    HCRYPTKEY hKey = NULL;
-    HCRYPTKEY hXchgKey = NULL;
-    HCRYPTHASH hHash = NULL;
 
-    if (!CryptAcquireContext(&hCryptProv, NULL, MS_ENH_RSA_AES_PROV, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-        std::cerr << "Error: CryptAcquireContext" << std::endl;
-        return false;
+BOOL EncryptAes(AESCONTEXT* pAesContext, BYTE* data, DWORD length, BYTE*& output, DWORD& output_length)
+{
+    DWORD padded_length = pAesContext->block_length * ((length + pAesContext->block_length - 1) / pAesContext->block_length);
+    output = static_cast<BYTE*>(LocalAlloc(LPTR, padded_length));
+    if (!output)
+    {
+        std::cerr << "Failed to allocate memory for encrypted data." << std::endl;
+        return FALSE;
     }
 
-    struct {
-        BLOBHEADER header;
-        DWORD key_length;
-        BYTE key[32];
-    } AES256KeyBlob = {
-            {PLAINTEXTKEYBLOB, CUR_BLOB_VERSION, 0, CALG_AES_256},
-            32,
-            {0}
-    };
-    memcpy(AES256KeyBlob.key, key, 32);
-
-    if (!CryptImportKey(hCryptProv, reinterpret_cast<BYTE *>(&AES256KeyBlob), sizeof(AES256KeyBlob), 0, 0, &hKey)) {
-        std::cerr << "Error: CryptImportKey" << std::endl;
-        CryptReleaseContext(hCryptProv, 0);
-        return false;
+    if (!CryptEncrypt(pAesContext->hKey, 0, TRUE, 0, output, &length, padded_length))
+    {
+        LocalFree(output);
+        std::cerr << "Failed to encrypt data using AES algorithm." << std::endl;
+        return FALSE;
     }
 
-    if (!CryptSetKeyParam(hKey, KP_IV, iv, 0)) {
-        std::cerr << "Error: CryptSetKeyParam" << std::endl;
-        CryptDestroyKey(hKey);
-        CryptReleaseContext(hCryptProv, 0);
-        return false;
+    output_length = length;
+    return TRUE;
+}
+
+BOOL Encrypt(AESCONTEXT* pAesContext, BYTE* data, DWORD& length)
+{
+    BYTE* new_data = nullptr;
+    DWORD new_length = 0;
+    if (!EncryptAes(pAesContext, data, length, new_data, new_length))
+    {
+        LocalFree(new_data);
+        std::cerr << "Failed to encrypt data using AES algorithm." << std::endl;
+        return FALSE;
     }
 
-    decrypted_data.resize(static_cast<size_t>(data_size));
-    memcpy(decrypted_data.data(), data, data_size);
+    memcpy_s(data, length, new_data, new_length);
+    length = new_length;
 
-    if (!CryptDecrypt(hKey, 0, TRUE, 0, decrypted_data.data(), &data_size)) {
-        std::cerr << "Error: CryptDecrypt" << std::endl;
-        CryptDestroyKey(hKey);
-        CryptReleaseContext(hCryptProv, 0);
-        return false;
+    LocalFree(new_data);
+    return TRUE;
+}
+
+void CloseAes(AESCONTEXT* pAesContext)
+{
+    if (pAesContext != nullptr)
+    {
+        CryptDestroyKey(pAesContext->hKey);
+        CryptReleaseContext(pAesContext->hCryptProv, 0);
+        delete pAesContext;
+    }
+}
+
+BOOL CreateCompressor(HCOMPRESSOR& hCompressor)
+{
+    hCompressor = CreateCompressor(COMPRESS_ALGORITHM_LZMS, nullptr, nullptr);
+    return (hCompressor != nullptr);
+}
+
+BOOL Compress(HCOMPRESSOR& hCompressor, BYTE* data, DWORD& length)
+{
+    BYTE* new_data = static_cast<BYTE*>(LocalAlloc(LPTR, length));
+    DWORD new_length = 0;
+    BOOL result = Compress(hCompressor, data, length, new_data, &new_length, nullptr);
+    if (result)
+    {
+        memcpy_s(data, length, new_data, new_length);
+        length = new_length;
     }
 
-    if (data_size > 0 && decrypted_data[data_size - 1] <= 16) {
-        BYTE padding_size = decrypted_data[data_size - 1];
-        bool valid_padding = true;
-        for (int i = 1; i <= padding_size; i++) {
-            if (decrypted_data[data_size - i] != padding_size) {
-                valid_padding = false;
-                break;
-            }
-        }
-        if (valid_padding) {
-            data_size -= padding_size;
-        }
+    LocalFree(new_data);
+    return result;
+}
+
+void CloseCompressor(HCOMPRESSOR hCompressor)
+{
+    if (hCompressor != nullptr)
+    {
+        CloseCompressor(hCompressor);
     }
-
-    decrypted_data.resize(static_cast<size_t>(data_size));
-
-    CryptDestroyHash(hHash);
-    CryptDestroyKey(hKey);
-    CryptDestroyKey(hXchgKey);
-    CryptReleaseContext(hCryptProv, 0);
-
-    return true;
 }
